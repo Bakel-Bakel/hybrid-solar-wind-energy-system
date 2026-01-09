@@ -1,0 +1,17 @@
+[Unit]
+Description=Hybrid Solar-Wind Energy Monitoring System
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/hybrid/demo
+ExecStart=/home/pi/hybrid/demo/start.sh --foreground
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
