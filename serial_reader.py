@@ -35,7 +35,7 @@ from datetime import datetime
 # Serial port configuration
 BAUD_RATE = 115200
 TIMEOUT = 1.0
-CONNECTION_TEST_TIMEOUT = 3.0  # Seconds to wait for Arduino data during detection
+CONNECTION_TEST_TIMEOUT = 5.0  # Seconds to wait for Arduino data during detection
 
 # Database configuration
 DB_NAME = "hybrid_system.db"
@@ -93,19 +93,22 @@ def parse_arduino_data(line: str, previous_values: Dict[str, float]) -> Optional
     values = {}
     
     # Parse SOL V: and I: (solar voltage and current in mA)
-    sol_match = re.search(r'SOL V:([\d.]+)\s+I:([\d.]+)', line)
+    # Allow flexible spacing: "SOL V:" or "SOLV:" or "SOL  V:"
+    sol_match = re.search(r'SOL\s*V:([\d.]+)\s+I:([\d.]+)', line, re.IGNORECASE)
     if sol_match:
         values['v_pv'] = float(sol_match.group(1))
         values['i_pv'] = float(sol_match.group(2)) / 1000.0  # Convert mA to A
     
     # Parse WND V: and I: (wind voltage and current)
-    wnd_match = re.search(r'WND V:([\d.]+)\s+I:([\d.]+)', line)
+    # Allow flexible spacing: "WND V:" or "WNDV:" or "WND  V:"
+    wnd_match = re.search(r'WND\s*V:([\d.]+)\s+I:([\d.]+)', line, re.IGNORECASE)
     if wnd_match:
         values['v_wind'] = float(wnd_match.group(1))
         values['i_wind'] = float(wnd_match.group(2))
     
     # Parse LUX: and FAN: (light level and fan PWM percentage)
-    lux_fan_match = re.search(r'LUX:([\d.]+)\s+FAN:([\d.]+)%', line)
+    # Allow flexible spacing
+    lux_fan_match = re.search(r'LUX:([\d.]+)\s+FAN:([\d.]+)%', line, re.IGNORECASE)
     if lux_fan_match:
         values['lux'] = float(lux_fan_match.group(1))
         values['fan_pwm'] = float(lux_fan_match.group(2))
@@ -158,31 +161,58 @@ def test_arduino_connection(port: str) -> bool:
     try:
         # Try to open the port
         ser = serial.Serial(port, BAUD_RATE, timeout=TIMEOUT)
-        time.sleep(1)  # Give Arduino time to initialize
+        time.sleep(2)  # Give Arduino time to initialize and send first data
         
-        # Clear any buffered data
+        # Clear any buffered data (but Arduino sends data every ~1 second, so we'll get fresh data)
         ser.reset_input_buffer()
         
         # Wait for data and check if it matches Arduino format
+        # Arduino sends data every 1 second, so we need to wait at least that long
+        # Don't clear buffer immediately - Arduino might have just sent data
+        time.sleep(0.5)  # Brief wait before checking
+        
         start_time = time.time()
         lines_checked = 0
-        max_lines = 20
+        max_lines = 50  # Increased to handle error messages and multiple data blocks
+        last_data_time = start_time
         
+        # Skip error/debug messages that might come first
         while (time.time() - start_time) < CONNECTION_TEST_TIMEOUT and lines_checked < max_lines:
             if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                
-                if line:
-                    # Check for Arduino data format markers
-                    if re.search(r'SOL V:[\d.]+', line) or \
-                       re.search(r'WND V:[\d.]+', line) or \
-                       re.search(r'LUX:[\d.]+', line):
-                        ser.close()
-                        return True
-                
-                lines_checked += 1
+                last_data_time = time.time()
+                try:
+                    line = ser.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    if line:
+                        # Skip error messages and debug output
+                        if line.startswith('[') or 'ERROR' in line.upper() or 'not configured' in line.lower():
+                            lines_checked += 1
+                            continue
+                        
+                        # Check for Arduino data format markers (more flexible matching)
+                        # Match patterns like "SOL V:1.45 I:0" or "WND V:0.00 I:0.000" or "LUX:0 FAN:0%"
+                        # Also accept "SOLV:" (no space) as some serial outputs might compress spaces
+                        if re.search(r'SOL\s*V:[\d.]+', line, re.IGNORECASE) or \
+                           re.search(r'WND\s*V:[\d.]+', line, re.IGNORECASE) or \
+                           re.search(r'LUX:[\d.]+', line, re.IGNORECASE) or \
+                           re.search(r'SP:[\d.]+', line, re.IGNORECASE) or \
+                           re.search(r'WP:[\d.]+', line, re.IGNORECASE):
+                            ser.close()
+                            return True
+                    
+                    lines_checked += 1
+                except UnicodeDecodeError:
+                    # Skip invalid data
+                    lines_checked += 1
+                    continue
             else:
-                time.sleep(0.1)
+                # If we haven't seen data in a while, wait longer
+                # Arduino sends data every ~1 second, so wait up to 2 seconds for next cycle
+                elapsed_since_data = time.time() - last_data_time
+                if elapsed_since_data > 2.0 and lines_checked > 5:
+                    # We've waited long enough, probably not Arduino
+                    break
+                time.sleep(0.2)
         
         ser.close()
         return False
@@ -219,11 +249,12 @@ def auto_detect_arduino_port() -> Optional[str]:
     # Test each port
     for port in ports:
         print(f"  Testing {port}...", end=" ", flush=True)
-        if test_arduino_connection(port):
+        result = test_arduino_connection(port)
+        if result:
             print("✓ Arduino detected!")
             return port
         else:
-            print("✗ Not Arduino")
+            print("✗ Not Arduino (no data format match)")
     
     print("\nArduino not found on any port.")
     print("Make sure:")
@@ -305,7 +336,7 @@ def read_arduino_data(ser: serial.Serial) -> Optional[Dict[str, float]]:
     """
     accumulated = {}
     lines_read = 0
-    max_lines = 10  # Safety limit
+    max_lines = 20  # Increased to handle error messages
     
     # Read lines until we get the separator line
     while lines_read < max_lines:
@@ -313,9 +344,20 @@ def read_arduino_data(ser: serial.Serial) -> Optional[Dict[str, float]]:
             time.sleep(0.1)
             continue
         
-        line = ser.readline().decode('utf-8', errors='ignore').strip()
+        try:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+        except UnicodeDecodeError:
+            # Skip invalid data
+            lines_read += 1
+            continue
         
         if not line:
+            lines_read += 1
+            continue
+        
+        # Skip error messages and debug output
+        if line.startswith('[') or 'ERROR' in line.upper() or 'not configured' in line.lower():
+            lines_read += 1
             continue
         
         # Check for separator line
