@@ -32,7 +32,7 @@ from datetime import datetime
 
 
 # Serial port configuration
-SERIAL_PORT = "/dev/ttyACM0"  # Default Arduino port on Linux
+SERIAL_PORT = "/dev/ttyUSB0"  # Default Arduino port on Linux
 BAUD_RATE = 115200
 TIMEOUT = 1.0
 
