@@ -12,7 +12,8 @@ set -e
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERIAL_PORT="${SERIAL_PORT:-/dev/ttyACM0}"
+# SERIAL_PORT is optional - if not set, serial_reader.py will auto-detect Arduino
+SERIAL_PORT="${SERIAL_PORT:-}"
 API_PORT="${API_PORT:-8000}"
 STREAMLIT_PORT="${STREAMLIT_PORT:-8501}"
 
@@ -133,12 +134,14 @@ print_info "Checking dependencies..."
 pip install -q --upgrade pip
 pip install -q -r "$SCRIPT_DIR/requirements.txt"
 
-# Check if serial port exists
-if [ ! -e "$SERIAL_PORT" ]; then
-    print_warn "Serial port $SERIAL_PORT not found"
+# Check serial port (only if explicitly set)
+if [ -n "$SERIAL_PORT" ] && [ ! -e "$SERIAL_PORT" ]; then
+    print_warn "Specified serial port $SERIAL_PORT not found"
     print_info "Available serial ports:"
     ls -1 /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || echo "  (none found)"
-    print_warn "Continuing anyway - serial reader will wait for connection"
+    print_warn "Continuing anyway - serial reader will auto-detect if port not specified"
+elif [ -z "$SERIAL_PORT" ]; then
+    print_info "Serial port not specified - serial reader will auto-detect Arduino"
 fi
 
 # Function to start serial reader
@@ -146,11 +149,19 @@ start_serial_reader() {
     if [ "$FOREGROUND" = true ]; then
         print_info "Starting Serial Reader (foreground)..."
         cd "$SCRIPT_DIR"
-        python3 serial_reader.py "$SERIAL_PORT"
+        if [ -n "$SERIAL_PORT" ]; then
+            python3 serial_reader.py "$SERIAL_PORT"
+        else
+            python3 serial_reader.py
+        fi
     else
         print_info "Starting Serial Reader (background)..."
         cd "$SCRIPT_DIR"
-        nohup python3 serial_reader.py "$SERIAL_PORT" > "$SERIAL_LOG" 2>&1 &
+        if [ -n "$SERIAL_PORT" ]; then
+            nohup python3 serial_reader.py "$SERIAL_PORT" > "$SERIAL_LOG" 2>&1 &
+        else
+            nohup python3 serial_reader.py > "$SERIAL_LOG" 2>&1 &
+        fi
         echo $! > "$SERIAL_PID_FILE"
         sleep 2
         if is_running "$SERIAL_PID_FILE"; then

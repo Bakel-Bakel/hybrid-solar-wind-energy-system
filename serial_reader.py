@@ -13,7 +13,7 @@ The Arduino sends data in this format:
     --------------------------
 
 The reader:
-- Connects to the Arduino via /dev/ttyACM0 (or specified port)
+- Automatically detects the Arduino port by scanning available USB serial devices
 - Parses the serial data format
 - Extracts sensor values (v_pv, i_pv, v_wind, i_wind, lux, fan_pwm)
 - Calculates or estimates missing values (v_bat, soc, wind_speed)
@@ -25,16 +25,17 @@ Run this script to start reading from Arduino:
 
 import sqlite3
 import serial
+import serial.tools.list_ports
 import time
 import re
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime
 
 
 # Serial port configuration
-SERIAL_PORT = "/dev/ttyUSB0"  # Default Arduino port on Linux
 BAUD_RATE = 115200
 TIMEOUT = 1.0
+CONNECTION_TEST_TIMEOUT = 3.0  # Seconds to wait for Arduino data during detection
 
 # Database configuration
 DB_NAME = "hybrid_system.db"
@@ -113,6 +114,122 @@ def parse_arduino_data(line: str, previous_values: Dict[str, float]) -> Optional
     if values:
         return values
     
+    return None
+
+
+def find_available_ports() -> List[str]:
+    """
+    Find all available serial ports on the system.
+    
+    Returns:
+        List of serial port device paths
+    """
+    ports = []
+    # Get all serial ports
+    available_ports = serial.tools.list_ports.comports()
+    
+    for port_info in available_ports:
+        # Filter for common Arduino ports (Linux)
+        port_path = port_info.device
+        if port_path.startswith('/dev/ttyACM') or port_path.startswith('/dev/ttyUSB'):
+            ports.append(port_path)
+    
+    # Also check common paths directly (in case list_ports doesn't find them)
+    import os
+    common_paths = ['/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0', '/dev/ttyUSB1']
+    for path in common_paths:
+        if os.path.exists(path) and path not in ports:
+            ports.append(path)
+    
+    return sorted(ports)
+
+
+def test_arduino_connection(port: str) -> bool:
+    """
+    Test if a serial port is connected to the Arduino by checking for expected data format.
+    
+    Args:
+        port: Serial port path to test
+        
+    Returns:
+        True if Arduino data format is detected, False otherwise
+    """
+    ser = None
+    try:
+        # Try to open the port
+        ser = serial.Serial(port, BAUD_RATE, timeout=TIMEOUT)
+        time.sleep(1)  # Give Arduino time to initialize
+        
+        # Clear any buffered data
+        ser.reset_input_buffer()
+        
+        # Wait for data and check if it matches Arduino format
+        start_time = time.time()
+        lines_checked = 0
+        max_lines = 20
+        
+        while (time.time() - start_time) < CONNECTION_TEST_TIMEOUT and lines_checked < max_lines:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                
+                if line:
+                    # Check for Arduino data format markers
+                    if re.search(r'SOL V:[\d.]+', line) or \
+                       re.search(r'WND V:[\d.]+', line) or \
+                       re.search(r'LUX:[\d.]+', line):
+                        ser.close()
+                        return True
+                
+                lines_checked += 1
+            else:
+                time.sleep(0.1)
+        
+        ser.close()
+        return False
+        
+    except (serial.SerialException, OSError, ValueError) as e:
+        if ser and ser.is_open:
+            ser.close()
+        return False
+    except Exception:
+        if ser and ser.is_open:
+            ser.close()
+        return False
+
+
+def auto_detect_arduino_port() -> Optional[str]:
+    """
+    Automatically detect the Arduino port by scanning available serial ports.
+    
+    Returns:
+        Port path if Arduino is found, None otherwise
+    """
+    print("Scanning for Arduino...")
+    
+    # Find all available ports
+    ports = find_available_ports()
+    
+    if not ports:
+        print("No serial ports found. Make sure Arduino is connected via USB.")
+        return None
+    
+    print(f"Found {len(ports)} serial port(s): {', '.join(ports)}")
+    print("Testing ports for Arduino data...")
+    
+    # Test each port
+    for port in ports:
+        print(f"  Testing {port}...", end=" ", flush=True)
+        if test_arduino_connection(port):
+            print("✓ Arduino detected!")
+            return port
+        else:
+            print("✗ Not Arduino")
+    
+    print("\nArduino not found on any port.")
+    print("Make sure:")
+    print("  1. Arduino is connected via USB")
+    print("  2. Arduino code is uploaded and running")
+    print("  3. No other programs are using the serial port")
     return None
 
 
@@ -250,15 +367,25 @@ def insert_sample(conn: sqlite3.Connection, sample: Dict[str, float]) -> None:
     conn.commit()
 
 
-def run_serial_reader(port: str = SERIAL_PORT) -> None:
+def run_serial_reader(port: Optional[str] = None) -> None:
     """
     Main serial reader loop. Reads data from Arduino and stores in database.
     
     Args:
-        port: Serial port path (default: /dev/ttyACM0)
+        port: Serial port path (optional, will auto-detect if None)
     """
     print("Starting Hybrid Solar-Wind Energy System Serial Reader")
     print("=" * 60)
+    
+    # Auto-detect Arduino port if not specified
+    if port is None:
+        port = auto_detect_arduino_port()
+        if port is None:
+            print("\nFailed to detect Arduino. Exiting.")
+            return
+    else:
+        print(f"Using specified port: {port}")
+    
     print(f"Connecting to Arduino on {port} at {BAUD_RATE} baud...")
     
     # Initialize database
@@ -357,7 +484,12 @@ def run_serial_reader(port: str = SERIAL_PORT) -> None:
 if __name__ == "__main__":
     import sys
     
-    # Allow port to be specified as command line argument
-    port = sys.argv[1] if len(sys.argv) > 1 else SERIAL_PORT
+    # Allow port to be specified as command line argument, otherwise auto-detect
+    if len(sys.argv) > 1:
+        port = sys.argv[1]
+        print(f"Using command-line specified port: {port}")
+    else:
+        port = None  # Will trigger auto-detection
+    
     run_serial_reader(port)
 
